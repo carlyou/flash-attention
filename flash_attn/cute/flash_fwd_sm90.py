@@ -179,6 +179,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        output_scale_inv: Optional[Float32] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -187,7 +188,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-
         self._check_type(
             *(
                 t.element_type if t is not None else None
@@ -411,6 +411,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            output_scale_inv,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -458,6 +459,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         num_splits: Int32 = Int32(1),
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
+        output_scale_inv: Optional[Float32] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -1294,6 +1296,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx,
                 batch_idx,
                 split_idx,
+                output_scale_inv,
             )
 
             tile_scheduler.advance_to_next_work()

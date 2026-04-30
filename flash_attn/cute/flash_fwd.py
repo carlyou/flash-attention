@@ -56,6 +56,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        quant_key: Optional[cutlass.Constexpr[str]] = None,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -75,6 +76,9 @@ class FlashAttentionForwardBase:
             Callable signature: ``score_mod(scores, batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Any``
         :param mask_mod: A callable that takes the attention scores and returns a boolean representing whether that score should be masked.
             Callable signature: ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Boolean``
+        :param quant_key: vLLM-style fused output-quant flavor (e.g.
+            ``"kFp8StaticTensorSym"``). None = no quant fold. SM90/SM100/SM110
+            implement the fold today; SM80/SM120 reject in ``__init__``.
         """
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -98,6 +102,7 @@ class FlashAttentionForwardBase:
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.quant_key = quant_key
         self.qk_acc_dtype = Float32
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -343,6 +348,7 @@ class FlashAttentionForwardBase:
         head_idx: Int32,
         batch_idx: Int32,
         split_idx: Int32 = Int32(0),
+        output_scale_inv: Optional[Float32] = None,
     ):
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         pack_gqa = PackGQA(
@@ -351,7 +357,11 @@ class FlashAttentionForwardBase:
 
         if const_expr(not self.is_split_kv):
             rO = cute.make_fragment_like(acc_O, self.dtype)
-            rO.store(acc_O.load().to(self.dtype))
+            # Fold per-tensor output scale into the cast (fused FP8 out).
+            if const_expr(self.quant_key == "kFp8StaticTensorSym"):
+                rO.store((acc_O.load() * output_scale_inv).to(self.dtype))
+            else:
+                rO.store(acc_O.load().to(self.dtype))
             # Make sure all threads have finished reading V
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
@@ -604,6 +614,12 @@ class FlashAttentionForwardBase:
 
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        assert self.quant_key is None, (
+            f"FP8 output not implemented for {type(self).__name__}"
+        )
+
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
@@ -665,6 +681,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
+        output_scale_inv: Optional[Float32] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -762,6 +779,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_tensors,
             fastdiv_mods,
+            output_scale_inv,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -801,6 +819,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
+        output_scale_inv: Optional[Float32] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1106,6 +1125,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block,
             num_head,
             batch_size,
+            output_scale_inv=output_scale_inv,
         )
 
     @cute.jit
