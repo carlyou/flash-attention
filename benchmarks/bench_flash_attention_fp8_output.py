@@ -12,9 +12,9 @@ for each path, plus the saved-time delta.
 
 Usage:
 
-    python benchmarks/benchmark_fp8_output.py
-    python benchmarks/benchmark_fp8_output.py --shape mha_4k --shape mla_prefill
-    python benchmarks/benchmark_fp8_output.py --rep 50
+    python benchmarks/bench_flash_attention_fp8_output.py
+    python benchmarks/bench_flash_attention_fp8_output.py --shape prefill_mla_4k
+    python benchmarks/bench_flash_attention_fp8_output.py --rep 50
 
 Requires SM100/SM110 (Blackwell) for the fused path. Other archs reject FP8
 output in the per-arch __init__ assert and will fail to launch.
@@ -31,16 +31,21 @@ from flash_attn.cute.interface import flash_attn_func
 
 
 # (name, batch, seqlen_q, seqlen_k, num_heads, num_kv_heads, head_dim, head_dim_v, causal)
+# Naming convention: <mode>_<attn>_<seqlen>, where:
+#   mode = prefill (sq == sk) | decode (sq == 1, sk large)
+#   attn = mla (qk=192, v=128) | mha (h_q == h_kv) | gqa (h_q > h_kv)
+#   seqlen = the K-side context length
 SHAPES = {
+    # DeepSeek-V3 MLA prefill — the primary target of this PR.
+    "prefill_mla_4k":  (2,  4096, 4096, 16,   1, 192, 128, True),
     # Standard MHA prefill, 4K context.
-    "mha_4k":       (2,  4096, 4096, 32,  32, 128, 128, True),
-    # GQA prefill, 8K context (Llama-style 8:1 ratio).
-    "gqa_8k":       (2,  8192, 8192, 32,   4, 128, 128, True),
-    # DeepSeek-V3 MLA prefill: hdim_qk=192, hdim_v=128.
-    "mla_prefill":  (2,  4096, 4096, 16,   1, 192, 128, True),
-    # Decode-style: seqlen_q=1, long K — typical FP8-attn use case.
-    "mla_decode":   (16,    1, 8192, 16,   1, 128, 128, True),
-    "mha_decode":   (16,    1, 8192, 16,  16, 128, 128, True),
+    "prefill_mha_4k":  (2,  4096, 4096, 32,  32, 128, 128, True),
+    # Llama-style GQA prefill (8:1 ratio), 8K context.
+    "prefill_gqa_8k":  (2,  8192, 8192, 32,   4, 128, 128, True),
+    # GQA decode (sq=1, h=16/1), 8K context — common decode shape.
+    "decode_gqa_8k":   (16,    1, 8192, 16,   1, 128, 128, True),
+    # MHA decode, 8K context.
+    "decode_mha_8k":   (16,    1, 8192, 16,  16, 128, 128, True),
 }
 
 
