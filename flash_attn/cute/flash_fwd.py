@@ -348,7 +348,6 @@ class FlashAttentionForwardBase:
         head_idx: Int32,
         batch_idx: Int32,
         split_idx: Int32 = Int32(0),
-        output_scale_inv: Optional[Float32] = None,
     ):
         cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
         pack_gqa = PackGQA(
@@ -357,11 +356,7 @@ class FlashAttentionForwardBase:
 
         if const_expr(not self.is_split_kv):
             rO = cute.make_fragment_like(acc_O, self.dtype)
-            # Fold per-tensor output scale into the cast (fused FP8 out).
-            if const_expr(self.quant_key == "kFp8StaticTensorSym"):
-                rO.store((acc_O.load() * output_scale_inv).to(self.dtype))
-            else:
-                rO.store(acc_O.load().to(self.dtype))
+            rO.store(acc_O.load().to(self.dtype))
             # Make sure all threads have finished reading V
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
@@ -1125,7 +1120,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block,
             num_head,
             batch_size,
-            output_scale_inv=output_scale_inv,
         )
 
     @cute.jit

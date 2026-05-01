@@ -1299,7 +1299,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx,
                 batch_idx,
                 split_idx,
-                output_scale_inv,
             )
 
             tile_scheduler.advance_to_next_work()
