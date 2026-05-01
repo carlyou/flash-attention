@@ -3,9 +3,12 @@
 Quantifies the win of writing FP8 directly from the attention epilogue instead
 of running attention to BF16 and then quantizing in a separate kernel. FA4
 itself ships no FP8 quant op, so the "unfused" baseline uses a torch.compile'd
-eager `(out / scale).clamp.to(fp8)`. torch.compile fuses the divide+clamp+cast
+eager `(out / scale).clamp.to(fp8)`. torch.compile fuses divide+clamp+cast
 into a single kernel — close enough to a hand-tuned CUDA op that the numbers
 are directionally accurate (a tuned op would be ~equal or marginally faster).
+
+Output format mirrors `benchmark_attn.py`: per-shape lines with ms and TFLOPS
+for each path, plus the saved-time delta.
 
 Usage:
 
@@ -23,6 +26,7 @@ import time
 import torch
 from triton.testing import do_bench
 
+from flash_attn.cute.bench_utils import flops
 from flash_attn.cute.interface import flash_attn_func
 
 
@@ -89,22 +93,28 @@ def bench_one(name, shape, warmup, rep):
             quant_kwargs={"quant_key": "kFp8StaticTensorSym", "out_scale": out_scale},
         )
 
-    time.sleep(0.5)
-    ms_bf16 = do_bench(fwd_bf16, warmup=warmup, rep=rep)
-    time.sleep(0.5)
-    ms_unfused = do_bench(fwd_bf16_then_quant, warmup=warmup, rep=rep)
-    time.sleep(0.5)
-    ms_fused = do_bench(fwd_fp8_fused, warmup=warmup, rep=rep)
+    # `time.sleep(1.0)` between runs matches benchmark_attn.py — lets the GPU
+    # cool / clock-stabilize between back-to-back do_bench windows.
+    time.sleep(1.0)
+    ms_bf16 = do_bench(fwd_bf16, warmup=warmup, rep=rep) * 1e-3
+    time.sleep(1.0)
+    ms_unfused = do_bench(fwd_bf16_then_quant, warmup=warmup, rep=rep) * 1e-3
+    time.sleep(1.0)
+    ms_fused = do_bench(fwd_fp8_fused, warmup=warmup, rep=rep) * 1e-3
 
-    overhead_unfused = ms_unfused - ms_bf16
-    speedup = ms_unfused / ms_fused
+    # FLOPS shared by all three paths (post-quant cast is negligible vs attn).
+    n_flops = flops(batch, nh, sq, sk, dq, dv, causal=causal)
+    def tflops(s): return n_flops / s * 1e-12
+
     saved = ms_unfused - ms_fused
+    speedup = ms_unfused / ms_fused
 
     print(
         f"{name:<14} b={batch} sq={sq:>5} sk={sk:>5} h={nh:>3}/{nkv:<3} d={dq}-{dv:<3}  "
-        f"bf16={ms_bf16*1e3:>7.1f}us  bf16+quant={ms_unfused*1e3:>7.1f}us  "
-        f"fused-fp8={ms_fused*1e3:>7.1f}us  saved={saved*1e3:>+6.1f}us  "
-        f"({speedup:.2f}x vs unfused; quant-overhead={overhead_unfused*1e3:.1f}us)"
+        f"bf16={ms_bf16*1e6:>7.1f}us/{tflops(ms_bf16):>4.0f}TF  "
+        f"bf16+quant={ms_unfused*1e6:>7.1f}us/{tflops(ms_unfused):>4.0f}TF  "
+        f"fused-fp8={ms_fused*1e6:>7.1f}us/{tflops(ms_fused):>4.0f}TF  "
+        f"saved={saved*1e6:>+6.1f}us ({speedup:.2f}x)"
     )
 
 
@@ -113,7 +123,7 @@ def main():
     parser.add_argument("--shape", action="append", choices=list(SHAPES) + ["all"],
                         default=None, help="Shape preset to run (repeatable). Default: all.")
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--rep", type=int, default=20)
+    parser.add_argument("--rep", type=int, default=10)
     args = parser.parse_args()
 
     cap = torch.cuda.get_device_capability()
