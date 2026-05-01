@@ -77,8 +77,8 @@ class FlashAttentionForwardBase:
         :param mask_mod: A callable that takes the attention scores and returns a boolean representing whether that score should be masked.
             Callable signature: ``mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors) -> Boolean``
         :param quant_key: vLLM-style fused output-quant flavor (e.g.
-            ``"kFp8StaticTensorSym"``). None = no quant fold. SM90/SM100/SM110
-            implement the fold today; SM80/SM120 reject in ``__init__``.
+            ``"kFp8StaticTensorSym"``). None = no quant fold. SM100/SM110
+            implement the fold today; SM80/SM90/SM120 reject in ``__init__``.
         """
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size

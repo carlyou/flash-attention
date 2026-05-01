@@ -10,7 +10,7 @@
 # - varlen
 # - sliding window
 # - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
-# - per-tensor static FP8 (e4m3fn) output (SM90/SM100/SM110 fwd, incl. split-KV)
+# - per-tensor static FP8 (e4m3fn) output (SM100/SM110 fwd, incl. split-KV)
 #   via `out=` (FP8 dtype) + quant_kwargs={"quant_key": "kFp8StaticTensorSym",
 #   "out_scale": ...}
 
@@ -264,6 +264,7 @@ torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
 }
 
 
@@ -349,7 +350,7 @@ def _flash_attn_fwd(
         quant_kwargs: Output-quant params; required iff `out` has a quant dtype.
             Keys mirror vLLM's quant_utils.py. Today only:
             {"quant_key": "kFp8StaticTensorSym", "out_scale": s} — writes FP8
-            e4m3fn with dequant = out_fp8 * s. SM90/SM100/SM110 only.
+            e4m3fn with dequant = out_fp8 * s. SM100/SM110 only.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -467,7 +468,7 @@ def _flash_attn_fwd(
             assert out.dtype != torch.float8_e4m3fn, (
                 "out has FP8 dtype but no quant_kwargs/quant_key was provided"
             )
-        out_torch_dtype = out.dtype if out is not None else q.dtype
+        out_torch_dtype = q.dtype
         output_scale_inv = Float32(1.0)
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -1659,10 +1660,6 @@ class FlashAttnFunc(torch.autograd.Function):
                 mask_block_idx=mask_block_idx,
                 block_size=block_size,
             )
-        if out is not None and out.dtype == torch.float8_e4m3fn:
-            assert not q.requires_grad and not k.requires_grad and not v.requires_grad, (
-                "Fused FP8 output is forward-only; inputs must not require grad"
-            )
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -1744,10 +1741,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         out: Optional[torch.Tensor] = None,
         quant_kwargs: Optional[Dict[str, Any]] = None,
     ):
-        if out is not None and out.dtype == torch.float8_e4m3fn:
-            assert not q.requires_grad and not k.requires_grad and not v.requires_grad, (
-                "Fused FP8 output is forward-only; inputs must not require grad"
-            )
         out, lse = _flash_attn_fwd(
             q,
             k,

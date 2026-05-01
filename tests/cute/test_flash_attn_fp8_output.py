@@ -1,19 +1,18 @@
 # Copyright (c) 2025, the FlashAttention authors.
 """Correctness tests for the static per-tensor FP8 (e4m3fn) fused output
-epilogue (SM90/SM100/SM110).
+epilogue (SM100/SM110).
 
 The kernel is exercised with an FP8 output buffer + an FP32 `out_scale`
 (passed via `quant_kwargs={"quant_key": "kFp8StaticTensorSym", "out_scale": s}`);
 the FP32 accumulator is multiplied by `1/s` and cast to FP8 in the
-epilogue (`flash_fwd_sm100.py:correction_epilogue` on SM100/SM110,
-`flash_fwd.py:epilogue` on SM90; `flash_fwd_combine.py` for split-KV
-on either). Reference path: the same kernel with a BF16/FP16 output,
+epilogue (`flash_fwd_sm100.py:correction_epilogue`; `flash_fwd_combine.py`
+for split-KV). Reference path: the same kernel with a BF16/FP16 output,
 then quantize-to-FP8 in eager PyTorch (matches what the existing
 post-attention `static_scaled_fp8_quant` op produces). Both paths
 consume the same FP32 accumulator, so the only error source is FP8
 round-to-nearest at the bin boundary.
 
-Skipped on hardware that doesn't expose an SM90/SM100/SM110 forward path
+Skipped on hardware that doesn't expose an SM100/SM110 forward path
 (the kernel constructor enforces this via
 `BaseDSL._get_dsl().get_arch_enum()`).
 """
@@ -30,12 +29,12 @@ USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 IS_FP8_SM_SUPPORTED = (
     not USE_FAKE_TENSOR
     and torch.cuda.is_available()
-    and torch.cuda.get_device_capability()[0] in (9, 10)
+    and torch.cuda.get_device_capability()[0] == 10
 )
 
 skip_if_no_fp8_sm = pytest.mark.skipif(
     not IS_FP8_SM_SUPPORTED,
-    reason="Fused FP8 output requires SM90 (Hopper) or SM100/SM110 (Blackwell).",
+    reason="Fused FP8 output requires SM100/SM110 (Blackwell).",
 )
 
 
@@ -269,10 +268,14 @@ def test_fp8_output_validation_errors():
                        match="torch.float8_e4m3fn"):
         _flash_attn_fwd(q, k, v, out=bf16_out, quant_kwargs=fp8_kwargs, _arch=100)
 
-    # FP8 output on Ampere (SM80) and consumer Blackwell (SM120) -> rejected
-    # by the per-arch __init__ assert in each forward class.
+    # FP8 output on Ampere (SM80), Hopper (SM90), and consumer Blackwell
+    # (SM120) -> rejected by the per-arch __init__ assert in each forward
+    # class. SM90 plumbing is in place but the smem layouts / O copy atom
+    # still use input dtype; tracked for follow-up.
     with pytest.raises(AssertionError, match="FP8 output not implemented"):
         _flash_attn_fwd(q, k, v, out=out_fp8, quant_kwargs=fp8_kwargs, _arch=80)
+    with pytest.raises(AssertionError, match="FP8 output not implemented"):
+        _flash_attn_fwd(q, k, v, out=out_fp8, quant_kwargs=fp8_kwargs, _arch=90)
     with pytest.raises(AssertionError, match="FP8 output not implemented"):
         _flash_attn_fwd(q, k, v, out=out_fp8, quant_kwargs=fp8_kwargs, _arch=120)
 

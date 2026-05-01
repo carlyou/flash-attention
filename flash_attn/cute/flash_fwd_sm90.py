@@ -59,6 +59,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        assert self.quant_key is None, (
+            f"FP8 output not implemented for {type(self).__name__}"
+        )
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
