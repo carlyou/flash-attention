@@ -3,15 +3,18 @@
 Quantifies the win of writing FP8 directly from the attention epilogue instead
 of running attention to BF16 and then quantizing in a separate kernel. FA4
 itself ships no FP8 quant op, so the "unfused" baseline uses a torch.compile'd
-eager `(out / scale).clamp.to(fp8)`. torch.compile fuses the divide+clamp+cast
+eager `(out / scale).clamp.to(fp8)`. torch.compile fuses divide+clamp+cast
 into a single kernel — close enough to a hand-tuned CUDA op that the numbers
 are directionally accurate (a tuned op would be ~equal or marginally faster).
 
+Output format mirrors `benchmark_attn.py`: per-shape lines with ms and TFLOPS
+for each path, plus the saved-time delta.
+
 Usage:
 
-    python benchmarks/benchmark_fp8_output.py
-    python benchmarks/benchmark_fp8_output.py --shape mha_4k --shape mla_prefill
-    python benchmarks/benchmark_fp8_output.py --rep 50
+    python benchmarks/bench_flash_attention_fp8_output.py
+    python benchmarks/bench_flash_attention_fp8_output.py --shape prefill_mla_4k
+    python benchmarks/bench_flash_attention_fp8_output.py --rep 50
 
 Requires SM100/SM110 (Blackwell) for the fused path. Other archs reject FP8
 output in the per-arch __init__ assert and will fail to launch.
@@ -23,20 +26,26 @@ import time
 import torch
 from triton.testing import do_bench
 
+from flash_attn.cute.bench_utils import flops
 from flash_attn.cute.interface import flash_attn_func
 
 
 # (name, batch, seqlen_q, seqlen_k, num_heads, num_kv_heads, head_dim, head_dim_v, causal)
+# Naming convention: <mode>_<attn>_<seqlen>, where:
+#   mode = prefill (sq == sk) | decode (sq == 1, sk large)
+#   attn = mla (qk=192, v=128) | mha (h_q == h_kv) | gqa (h_q > h_kv)
+#   seqlen = the K-side context length
 SHAPES = {
+    # DeepSeek-V3 MLA prefill — the primary target of this PR.
+    "prefill_mla_4k":  (2,  4096, 4096, 16,   1, 192, 128, True),
     # Standard MHA prefill, 4K context.
-    "mha_4k":       (2,  4096, 4096, 32,  32, 128, 128, True),
-    # GQA prefill, 8K context (Llama-style 8:1 ratio).
-    "gqa_8k":       (2,  8192, 8192, 32,   4, 128, 128, True),
-    # DeepSeek-V3 MLA prefill: hdim_qk=192, hdim_v=128.
-    "mla_prefill":  (2,  4096, 4096, 16,   1, 192, 128, True),
-    # Decode-style: seqlen_q=1, long K — typical FP8-attn use case.
-    "mla_decode":   (16,    1, 8192, 16,   1, 128, 128, True),
-    "mha_decode":   (16,    1, 8192, 16,  16, 128, 128, True),
+    "prefill_mha_4k":  (2,  4096, 4096, 32,  32, 128, 128, True),
+    # Llama-style GQA prefill (8:1 ratio), 8K context.
+    "prefill_gqa_8k":  (2,  8192, 8192, 32,   4, 128, 128, True),
+    # GQA decode (sq=1, h=16/1), 8K context — common decode shape.
+    "decode_gqa_8k":   (16,    1, 8192, 16,   1, 128, 128, True),
+    # MHA decode, 8K context.
+    "decode_mha_8k":   (16,    1, 8192, 16,  16, 128, 128, True),
 }
 
 
@@ -89,22 +98,28 @@ def bench_one(name, shape, warmup, rep):
             quant_kwargs={"quant_key": "kFp8StaticTensorSym", "out_scale": out_scale},
         )
 
-    time.sleep(0.5)
-    ms_bf16 = do_bench(fwd_bf16, warmup=warmup, rep=rep)
-    time.sleep(0.5)
-    ms_unfused = do_bench(fwd_bf16_then_quant, warmup=warmup, rep=rep)
-    time.sleep(0.5)
-    ms_fused = do_bench(fwd_fp8_fused, warmup=warmup, rep=rep)
+    # `time.sleep(1.0)` between runs matches benchmark_attn.py — lets the GPU
+    # cool / clock-stabilize between back-to-back do_bench windows.
+    time.sleep(1.0)
+    ms_bf16 = do_bench(fwd_bf16, warmup=warmup, rep=rep) * 1e-3
+    time.sleep(1.0)
+    ms_unfused = do_bench(fwd_bf16_then_quant, warmup=warmup, rep=rep) * 1e-3
+    time.sleep(1.0)
+    ms_fused = do_bench(fwd_fp8_fused, warmup=warmup, rep=rep) * 1e-3
 
-    overhead_unfused = ms_unfused - ms_bf16
-    speedup = ms_unfused / ms_fused
+    # FLOPS shared by all three paths (post-quant cast is negligible vs attn).
+    n_flops = flops(batch, nh, sq, sk, dq, dv, causal=causal)
+    def tflops(s): return n_flops / s * 1e-12
+
     saved = ms_unfused - ms_fused
+    speedup = ms_unfused / ms_fused
 
     print(
         f"{name:<14} b={batch} sq={sq:>5} sk={sk:>5} h={nh:>3}/{nkv:<3} d={dq}-{dv:<3}  "
-        f"bf16={ms_bf16*1e3:>7.1f}us  bf16+quant={ms_unfused*1e3:>7.1f}us  "
-        f"fused-fp8={ms_fused*1e3:>7.1f}us  saved={saved*1e3:>+6.1f}us  "
-        f"({speedup:.2f}x vs unfused; quant-overhead={overhead_unfused*1e3:.1f}us)"
+        f"bf16={ms_bf16*1e6:>7.1f}us/{tflops(ms_bf16):>4.0f}TF  "
+        f"bf16+quant={ms_unfused*1e6:>7.1f}us/{tflops(ms_unfused):>4.0f}TF  "
+        f"fused-fp8={ms_fused*1e6:>7.1f}us/{tflops(ms_fused):>4.0f}TF  "
+        f"saved={saved*1e6:>+6.1f}us ({speedup:.2f}x)"
     )
 
 
@@ -113,7 +128,7 @@ def main():
     parser.add_argument("--shape", action="append", choices=list(SHAPES) + ["all"],
                         default=None, help="Shape preset to run (repeatable). Default: all.")
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--rep", type=int, default=20)
+    parser.add_argument("--rep", type=int, default=10)
     args = parser.parse_args()
 
     cap = torch.cuda.get_device_capability()
