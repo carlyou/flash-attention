@@ -65,9 +65,9 @@ def _per_seq_max(out: torch.Tensor) -> float:
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize(
     "head_dim,head_dim_v",
-    [(128, 128), (192, 128)],  # standard MHA + DeepSeek MLA prefill shape
+    [(64, 64), (128, 128), (192, 128)],  # small MHA + standard + DeepSeek MLA prefill
 )
-@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 def test_fp8_output_matches_post_quant(
     dtype: torch.dtype,
     causal: bool,
@@ -78,7 +78,12 @@ def test_fp8_output_matches_post_quant(
     torch.manual_seed(0)
     device = torch.device("cuda")
     batch, seqlen, num_heads = 2, 512, 16
-    num_kv_heads = num_heads if mha_type == "mha" else 4
+    if mha_type == "mha":
+        num_kv_heads = num_heads
+    elif mha_type == "mqa":
+        num_kv_heads = 1
+    else:  # gqa
+        num_kv_heads = 4
 
     q = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
     k = torch.randn(batch, seqlen, num_kv_heads, head_dim, dtype=dtype, device=device)
@@ -192,6 +197,125 @@ def test_fp8_output_scale_as_tensor():
     # Tensor scalar coercion (`.cpu().item()`) must produce the same FP8 bytes
     # as the equivalent Python float.
     assert torch.equal(out_a.view(torch.uint8), out_b.view(torch.uint8))
+
+
+@skip_if_no_fp8_sm
+@pytest.mark.parametrize(
+    "window_size",
+    [(128, 0), (64, 64), (-1, 0)],  # left-only causal local, symmetric local, full causal
+    ids=["causal_local_left", "symmetric_local", "causal_full"],
+)
+def test_fp8_output_sliding_window(window_size):
+    """Local / sliding-window masking exercises a different mask_mod path."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch, seqlen, num_heads = 2, 512, 8
+    head_dim = 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    causal = window_size == (-1, 0)
+    ws = (None, None) if causal else window_size
+
+    ref_out, _ = flash_attn_func(
+        q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=ws,
+    )
+    out_scale = _per_seq_max(ref_out)
+    ref_fp8 = _ref_quantize_fp8(ref_out, out_scale)
+
+    fused_buffer = torch.empty(
+        batch, seqlen, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device,
+    )
+    fused_out, _ = flash_attn_func(
+        q, k, v, softmax_scale=softmax_scale, causal=causal, window_size=ws,
+        out=fused_buffer,
+        quant_kwargs={"quant_key": "kFp8StaticTensorSym", "out_scale": out_scale},
+    )
+    fused_deq = fused_out.float() * out_scale
+    ref_deq = ref_fp8.float() * out_scale
+    torch.testing.assert_close(fused_deq, ref_deq, rtol=0.07, atol=1e-2)
+
+
+@skip_if_no_fp8_sm
+@pytest.mark.parametrize("softcap", [15.0, 30.0])
+def test_fp8_output_softcap(softcap: float):
+    """Softcap (Gemma/GLM) wraps logits through tanh before softmax."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch, seqlen, num_heads = 2, 512, 8
+    head_dim = 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    ref_out, _ = flash_attn_func(
+        q, k, v, softmax_scale=softmax_scale, causal=True, softcap=softcap,
+    )
+    out_scale = _per_seq_max(ref_out)
+    ref_fp8 = _ref_quantize_fp8(ref_out, out_scale)
+
+    fused_buffer = torch.empty(
+        batch, seqlen, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device,
+    )
+    fused_out, _ = flash_attn_func(
+        q, k, v, softmax_scale=softmax_scale, causal=True, softcap=softcap,
+        out=fused_buffer,
+        quant_kwargs={"quant_key": "kFp8StaticTensorSym", "out_scale": out_scale},
+    )
+    fused_deq = fused_out.float() * out_scale
+    ref_deq = ref_fp8.float() * out_scale
+    torch.testing.assert_close(fused_deq, ref_deq, rtol=0.07, atol=1e-2)
+
+
+@skip_if_no_fp8_sm
+@pytest.mark.parametrize(
+    "scale_factor",
+    [0.05, 1.0, 4.0],
+    ids=["scale_underuses_range", "scale_matches_peak", "scale_overuses_range"],
+)
+def test_fp8_output_scale_extremes(scale_factor: float):
+    """Sweep `out_scale` away from the peak-fitting choice.
+
+    - small scale (relative to peak): values divide to >fp8_max → clamp.
+    - matched scale: roughly fills the FP8 range.
+    - large scale: values divide to << 1 → mantissa truncation.
+
+    The fused kernel should agree with the eager reference under all three.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    batch, seqlen, num_heads = 2, 256, 8
+    head_dim = 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(batch, seqlen, num_heads, head_dim, dtype=dtype, device=device)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    ref_out, _ = flash_attn_func(q, k, v, softmax_scale=softmax_scale, causal=True)
+    out_scale = _per_seq_max(ref_out) * scale_factor
+    ref_fp8 = _ref_quantize_fp8(ref_out, out_scale)
+
+    fused_buffer = torch.empty(
+        batch, seqlen, num_heads, head_dim, dtype=torch.float8_e4m3fn, device=device,
+    )
+    fused_out, _ = flash_attn_func(
+        q, k, v, softmax_scale=softmax_scale, causal=True,
+        out=fused_buffer,
+        quant_kwargs={"quant_key": "kFp8StaticTensorSym", "out_scale": out_scale},
+    )
+    fused_deq = fused_out.float() * out_scale
+    ref_deq = ref_fp8.float() * out_scale
+    # Same ULP comparison on dequantized values; both clamp identically.
+    torch.testing.assert_close(fused_deq, ref_deq, rtol=0.07, atol=1e-2)
 
 
 @skip_if_no_fp8_sm
