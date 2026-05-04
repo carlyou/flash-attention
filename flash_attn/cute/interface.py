@@ -454,8 +454,8 @@ def _flash_attn_fwd(
         assert page_table is None, "fused FP8 output + paged KV not supported"
         out_torch_dtype = torch.float8_e4m3fn
         quant_key = "kFp8StaticTensorSym"
-        # Pre-invert on-device to avoid a per-call GPU→CPU sync.
-        output_scale_inv_t = (1.0 / output_scale.detach().reshape(1)).contiguous()
+        # Pass scale through as a 1-elem tensor; kernel inverts via rcp_approx.
+        output_scale_t = output_scale.detach().reshape(1).contiguous()
     else:
         if out is not None:
             assert out.dtype != torch.float8_e4m3fn, (
@@ -463,7 +463,7 @@ def _flash_attn_fwd(
             )
         out_torch_dtype = q.dtype
         quant_key = None
-        output_scale_inv_t = None
+        output_scale_t = None
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -680,12 +680,12 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
-            output_scale_inv_cute,
+            output_scale_cute,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale_inv_t)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale_t)
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -831,7 +831,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-            output_scale_inv_cute,
+            output_scale_cute,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -858,7 +858,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-            output_scale_inv_t,
+            output_scale_t,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -868,7 +868,7 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
-            output_scale_inv=output_scale_inv_t,
+            output_scale=output_scale_t,
         )
     return out, lse
 
@@ -1954,12 +1954,12 @@ def _compile_fwd_combine(
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
     mSemaphore = None  # Not parametrized in compile_key
 
-    output_scale_inv = fake_tensor(Float32, (1,), divisibility=1) if quant_key is not None else None
+    output_scale = fake_tensor(Float32, (1,), divisibility=1) if quant_key is not None else None
     return cute.compile(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
-        output_scale_inv,
+        output_scale,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1975,7 +1975,7 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
-    output_scale_inv: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -2005,12 +2005,12 @@ def _flash_attn_fwd_combine(
     # already pre-inverted the user's `output_scale` by this point).
     quant_key = "kFp8StaticTensorSym" if out.dtype == torch.float8_e4m3fn else None
     if quant_key is not None:
-        assert output_scale_inv is not None, (
-            f"output_scale_inv required for quant_key={quant_key!r}"
+        assert output_scale is not None, (
+            f"output_scale required for quant_key={quant_key!r}"
         )
     else:
-        assert output_scale_inv is None, (
-            "output_scale_inv only meaningful when out has a quantized dtype"
+        assert output_scale is None, (
+            "output_scale only meaningful when out has a quantized dtype"
         )
     if not is_fake_mode():
         assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
@@ -2066,7 +2066,7 @@ def _flash_attn_fwd_combine(
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
             semaphore_to_reset,
-            output_scale_inv if quant_key is not None else None,
+            output_scale if quant_key is not None else None,
         )
 
 
