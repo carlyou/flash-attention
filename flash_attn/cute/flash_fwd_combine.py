@@ -204,7 +204,7 @@ class FlashAttentionForwardCombine:
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         varlen_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
-        output_scale_inv: Optional[cute.Tensor] = None,
+        output_scale: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -319,7 +319,7 @@ class FlashAttentionForwardCombine:
             seqlen_divmod,
             head_divmod,
             varlen,
-            output_scale_inv,
+            output_scale,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -349,15 +349,15 @@ class FlashAttentionForwardCombine:
         seqlen_divmod: FastDivmodDivisor,
         head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
-        output_scale_inv: Optional[cute.Tensor] = None,
+        output_scale: Optional[cute.Tensor] = None,
     ):
         # Thread and block indices
         tidx, _, _ = cute.arch.thread_idx()
         m_block, k_block, maybe_virtual_batch = cute.arch.block_idx()
 
-        # Load pre-inverted FP8 output scale into a register; reuse the name.
+        # Load FP8 output scale and invert in-kernel via rcp_approx.
         if const_expr(self.quant_key == "kFp8StaticTensorSym"):
-            output_scale_inv = Float32(output_scale_inv[0])
+            output_scale_inv = cute.arch.rcp_approx(Float32(output_scale[0]))
 
         # Map virtual batch index to real batch index (for persistent tile schedulers)
         batch_idx = (

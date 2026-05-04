@@ -439,7 +439,6 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    # Static per-tensor symmetric FP8 only (internal tag: kFp8StaticTensorSym).
     if output_scale is not None:
         assert isinstance(output_scale, torch.Tensor), (
             "output_scale must be a torch.Tensor"
@@ -453,9 +452,9 @@ def _flash_attn_fwd(
         assert block_sparse_tensors is None, "fused FP8 output + block sparsity not supported"
         assert page_table is None, "fused FP8 output + paged KV not supported"
         out_torch_dtype = torch.float8_e4m3fn
+        # Static per-tensor symmetric FP8 only for now, quant_key is derived and passed in jit
         quant_key = "kFp8StaticTensorSym"
-        # Pre-invert on-device to avoid a per-call GPU→CPU sync.
-        output_scale_inv_t = (1.0 / output_scale.detach().reshape(1)).contiguous()
+        output_scale = output_scale.reshape(1)
     else:
         if out is not None:
             assert out.dtype != torch.float8_e4m3fn, (
@@ -463,7 +462,6 @@ def _flash_attn_fwd(
             )
         out_torch_dtype = q.dtype
         quant_key = None
-        output_scale_inv_t = None
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -680,12 +678,12 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
-            output_scale_inv_cute,
+            output_scale_tensor, # 1d scalar tensor
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale_inv_t)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale)
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -831,7 +829,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-            output_scale_inv_cute,
+            output_scale_tensor,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -858,7 +856,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-            output_scale_inv_t,
+            output_scale,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -868,7 +866,7 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
-            output_scale_inv=output_scale_inv_t,
+            output_scale=output_scale,
         )
     return out, lse
 
@@ -1953,13 +1951,13 @@ def _compile_fwd_combine(
     mNumSplitsDynamic = None  # Not parametrized in compile_key
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
     mSemaphore = None  # Not parametrized in compile_key
+    output_scale = fake_tensor(Float32, (1,), divisibility=1) if quant_key is not None else None
 
-    output_scale_inv = fake_tensor(Float32, (1,), divisibility=1) if quant_key is not None else None
     return cute.compile(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
-        output_scale_inv,
+        output_scale,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1975,7 +1973,7 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
-    output_scale_inv: Optional[torch.Tensor] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -2001,17 +1999,14 @@ def _flash_attn_fwd_combine(
     assert out_partial.dtype in [torch.float16, torch.bfloat16, torch.float32], (
         "out_partial must be fp16, bf16, or fp32"
     )
-    # Derive quant_key from out.dtype (internal helper; the public API has
-    # already pre-inverted the user's `output_scale` by this point).
-    quant_key = "kFp8StaticTensorSym" if out.dtype == torch.float8_e4m3fn else None
-    if quant_key is not None:
-        assert output_scale_inv is not None, (
-            f"output_scale_inv required for quant_key={quant_key!r}"
-        )
+
+    if output_scale is not None:
+        assert out.dtype == torch.float8_e4m3fn, "output quant only supports static fp8"
+        # Derive quant_key as compile key
+        quant_key = "kFp8StaticTensorSym"
     else:
-        assert output_scale_inv is None, (
-            "output_scale_inv only meaningful when out has a quantized dtype"
-        )
+        quant_key = None
+
     if not is_fake_mode():
         assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
     # Determine if this is variable length based on dimensions
@@ -2066,7 +2061,7 @@ def _flash_attn_fwd_combine(
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
             semaphore_to_reset,
-            output_scale_inv if quant_key is not None else None,
+            output_scale if quant_key is not None else None,
         )
 
 
