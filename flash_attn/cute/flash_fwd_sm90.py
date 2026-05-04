@@ -182,7 +182,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        output_scale_inv: Optional[Float32] = None,
+        output_scale_inv: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -462,7 +462,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         num_splits: Int32 = Int32(1),
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
-        output_scale_inv: Optional[Float32] = None,
+        output_scale_inv: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor

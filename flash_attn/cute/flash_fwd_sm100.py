@@ -354,7 +354,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        output_scale_inv: Optional[Float32] = None,
+        output_scale_inv: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -769,7 +769,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
-        output_scale_inv: Optional[Float32] = None,
+        output_scale_inv: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -2258,7 +2258,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
-        output_scale_inv: Optional[Float32] = None,
+        output_scale_inv: Optional[cute.Tensor] = None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2278,6 +2278,10 @@ class FlashAttentionForwardSm100:
 
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
+
+        # Load pre-inverted FP8 output scale into a register; reuse the name.
+        if const_expr(self.quant_key == "kFp8StaticTensorSym"):
+            output_scale_inv = Float32(output_scale_inv[0])
 
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled

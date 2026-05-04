@@ -11,8 +11,7 @@
 # - sliding window
 # - bwd pass for Ampere (will also run on Hopper/Blackwell, but will be slow)
 # - per-tensor static FP8 (e4m3fn) output (SM100/SM110 fwd, incl. split-KV)
-#   via `out=` (FP8 dtype) + quant_kwargs={"quant_key": "kFp8StaticTensorSym",
-#   "out_scale": ...}
+#   via `output_scale=` (a 0-d FP32 GPU tensor); output dtype is FP8 e4m3fn.
 
 # Features not supported yet:
 # - split (i.e. FlashDecoding)
@@ -26,7 +25,7 @@ import os
 import math
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Dict, Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -332,7 +331,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-    quant_kwargs: Optional[Dict[str, Any]] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -344,13 +343,12 @@ def _flash_attn_fwd(
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
             The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
-            FP8 (e4m3fn) dtype opts into fused-quant output (see `quant_kwargs`).
+            FP8 (e4m3fn) dtype is selected automatically when `output_scale` is set.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
-        quant_kwargs: Output-quant params; required iff `out` has a quant dtype.
-            Keys mirror vLLM's quant_utils.py. Today only:
-            {"quant_key": "kFp8StaticTensorSym", "out_scale": s} — writes FP8
-            e4m3fn with dequant = out_fp8 * s. SM100/SM110 only.
+        output_scale: 0-d FP32 GPU tensor. Presence opts into the static per-tensor
+            FP8 (e4m3fn) fused-quant output: the kernel writes FP8 with
+            dequant = out_fp8 * output_scale. SM100/SM110 only.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -441,35 +439,31 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    quant_key = quant_kwargs.get("quant_key") if quant_kwargs is not None else None
-    if quant_key is not None:
-        # Today only kFp8StaticTensorSym is implemented; future PRs add
-        # kFp8Dynamic128Sym / kFp8Dynamic64Sym / kNvfp4Dynamic alongside.
-        # Naming mirrors vllm/model_executor/layers/quantization/utils/quant_utils.py.
-        assert quant_key == "kFp8StaticTensorSym", (
-            f"quant_key={quant_key!r} not yet supported"
+    # Static per-tensor symmetric FP8 only (internal tag: kFp8StaticTensorSym).
+    if output_scale is not None:
+        assert isinstance(output_scale, torch.Tensor), (
+            "output_scale must be a torch.Tensor"
         )
+        assert output_scale.dtype == torch.float32, "output_scale must be float32"
+        assert output_scale.numel() == 1, "output_scale must be a scalar (numel == 1) tensor"
+        if not is_fake_mode():
+            assert output_scale.is_cuda and output_scale.device == q.device, (
+                "output_scale must be on the same CUDA device as q"
+            )
+        assert block_sparse_tensors is None, "fused FP8 output + block sparsity not supported"
+        assert page_table is None, "fused FP8 output + paged KV not supported"
         out_torch_dtype = torch.float8_e4m3fn
-        # Per-arch reject for unsupported quant_keys lives in each forward
-        # class's __init__ (e.g. FlashAttentionForwardSm80 asserts there).
-        out_scale = quant_kwargs.get("out_scale")
-        assert out_scale is not None, (
-            f"quant_kwargs['out_scale'] is required for quant_key={quant_key!r}"
-        )
-        assert block_sparse_tensors is None, "FP8 out + block sparsity not supported"
-        assert page_table is None, "FP8 out + paged KV not supported"
-        if isinstance(out_scale, torch.Tensor):
-            out_scale = float(out_scale.detach().cpu().item())
-        assert out_scale > 0.0, "quant_kwargs['out_scale'] must be positive"
-        output_scale_inv = Float32(1.0 / out_scale)
+        quant_key = "kFp8StaticTensorSym"
+        # Pre-invert on-device to avoid a per-call GPU→CPU sync.
+        output_scale_inv_t = (1.0 / output_scale.detach().reshape(1)).contiguous()
     else:
-        assert quant_kwargs is None, "quant_kwargs requires a quant_key"
         if out is not None:
             assert out.dtype != torch.float8_e4m3fn, (
-                "out has FP8 dtype but no quant_kwargs/quant_key was provided"
+                "out has FP8 dtype but no output_scale was provided"
             )
         out_torch_dtype = q.dtype
-        output_scale_inv = Float32(1.0)
+        quant_key = None
+        output_scale_inv_t = None
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
@@ -686,11 +680,12 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
+            output_scale_inv_cute,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, output_scale_inv_t)
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -836,7 +831,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-            output_scale_inv,
+            output_scale_inv_cute,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -863,7 +858,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
-            output_scale_inv,
+            output_scale_inv_t,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -873,7 +868,7 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
-            output_scale_inv=output_scale_inv if quant_key is not None else None,
+            output_scale_inv=output_scale_inv_t,
         )
     return out, lse
 
@@ -1648,7 +1643,7 @@ class FlashAttnFunc(torch.autograd.Function):
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
-        quant_kwargs: Optional[Dict[str, Any]] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1676,7 +1671,7 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             out=out,
-            quant_kwargs=quant_kwargs,
+            output_scale=output_scale,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1739,7 +1734,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
-        quant_kwargs: Optional[Dict[str, Any]] = None,
+        output_scale: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1764,7 +1759,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             out=out,
-            quant_kwargs=quant_kwargs,
+            output_scale=output_scale,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1831,7 +1826,7 @@ def flash_attn_func(
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
-    quant_kwargs: Optional[Dict[str, Any]] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1853,7 +1848,7 @@ def flash_attn_func(
         block_size,
         return_lse,
         out,
-        quant_kwargs,
+        output_scale,
     )
 
 
@@ -1880,7 +1875,7 @@ def flash_attn_varlen_func(
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
-    quant_kwargs: Optional[Dict[str, Any]] = None,
+    output_scale: Optional[torch.Tensor] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1905,7 +1900,7 @@ def flash_attn_varlen_func(
         aux_tensors,
         return_lse,
         out,
-        quant_kwargs,
+        output_scale,
     )
 
 
@@ -1959,12 +1954,12 @@ def _compile_fwd_combine(
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
     mSemaphore = None  # Not parametrized in compile_key
 
-    # Compile-time output_scale_inv is a typed placeholder; runtime supplies the value.
+    output_scale_inv = fake_tensor(Float32, (1,), divisibility=1) if quant_key is not None else None
     return cute.compile(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
-        Float32(1.0) if quant_key is not None else None,
+        output_scale_inv,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1980,7 +1975,7 @@ def _flash_attn_fwd_combine(
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
-    output_scale_inv: Optional[Float32] = None,
+    output_scale_inv: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -2007,7 +2002,7 @@ def _flash_attn_fwd_combine(
         "out_partial must be fp16, bf16, or fp32"
     )
     # Derive quant_key from out.dtype (internal helper; the public API has
-    # already validated the user's quant_kwargs by this point).
+    # already pre-inverted the user's `output_scale` by this point).
     quant_key = "kFp8StaticTensorSym" if out.dtype == torch.float8_e4m3fn else None
     if quant_key is not None:
         assert output_scale_inv is not None, (

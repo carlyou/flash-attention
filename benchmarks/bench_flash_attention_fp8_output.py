@@ -1,23 +1,9 @@
-"""Benchmark FA4 fused FP8 output epilogue vs. unfused (BF16 attn + post-quant).
+"""FA4 fused FP8 output vs. BF16 attn + torch.compile'd post-quant cast.
 
-Quantifies the win of writing FP8 directly from the attention epilogue instead
-of running attention to BF16 and then quantizing in a separate kernel. FA4
-itself ships no FP8 quant op, so the "unfused" baseline uses a torch.compile'd
-eager `(out / scale).clamp.to(fp8)`. torch.compile fuses divide+clamp+cast
-into a single kernel — close enough to a hand-tuned CUDA op that the numbers
-are directionally accurate (a tuned op would be ~equal or marginally faster).
+Requires SM100/SM110 (Blackwell). FA4 ships no FP8 quant op, so the unfused
+baseline uses torch.compile to fuse the divide+clamp+cast into one kernel.
 
-Output format mirrors `benchmark_attn.py`: per-shape lines with ms and TFLOPS
-for each path, plus the saved-time delta.
-
-Usage:
-
-    python benchmarks/bench_flash_attention_fp8_output.py
-    python benchmarks/bench_flash_attention_fp8_output.py --shape prefill_mla_4k
-    python benchmarks/bench_flash_attention_fp8_output.py --rep 50
-
-Requires SM100/SM110 (Blackwell) for the fused path. Other archs reject FP8
-output in the per-arch __init__ assert and will fail to launch.
+    python benchmarks/bench_flash_attention_fp8_output.py [--shape ...] [--rep N]
 """
 
 import argparse
@@ -50,17 +36,12 @@ SHAPES = {
 
 
 def static_fp8_quant_eager(out_bf16: torch.Tensor, inv_scale: float) -> torch.Tensor:
-    """Reference post-attention static-FP8 cast — single kernel via torch.compile.
-
-    Mirrors vLLM's `static_scaled_fp8_quant`: out / scale, clamp to [-fp8_max,
-    +fp8_max], cast to e4m3fn. `inv_scale` is `1/scale` (precomputed to keep the
-    hot path multiply-only).
-    """
+    """Stand-in for vLLM's `static_scaled_fp8_quant`."""
     finfo = torch.finfo(torch.float8_e4m3fn)
     return out_bf16.float().mul(inv_scale).clamp(finfo.min, finfo.max).to(torch.float8_e4m3fn)
 
 
-# Compile once for a fair per-call comparison; first call is excluded by do_bench warmup.
+
 _static_fp8_quant_compiled = torch.compile(static_fp8_quant_eager, mode="reduce-overhead")
 
 
@@ -78,28 +59,24 @@ def bench_one(name, shape, warmup, rep):
     finfo = torch.finfo(torch.float8_e4m3fn)
     out_scale = max(float(ref_out.float().abs().amax().item()) / finfo.max, 1e-4)
     inv_scale = 1.0 / out_scale
+    out_scale_t = torch.tensor(out_scale, dtype=torch.float32, device=device)
 
     fp8_buf = torch.empty(batch, sq, nh, dv, dtype=torch.float8_e4m3fn, device=device)
 
-    # ── Path A: BF16 attn only (lower bound; what attention costs without quant) ──
     def fwd_bf16():
         return flash_attn_func(q, k, v, causal=causal)
 
-    # ── Path B: BF16 attn + post-hoc fused FP8 cast (unfused baseline) ──
     def fwd_bf16_then_quant():
         out, _ = flash_attn_func(q, k, v, causal=causal)
         return _static_fp8_quant_compiled(out, inv_scale)
 
-    # ── Path C: FA4 FP8 fused output (this PR) ──
     def fwd_fp8_fused():
         return flash_attn_func(
             q, k, v, causal=causal,
             out=fp8_buf,
-            quant_kwargs={"quant_key": "kFp8StaticTensorSym", "out_scale": out_scale},
+            output_scale=out_scale_t,
         )
 
-    # `time.sleep(1.0)` between runs matches benchmark_attn.py — lets the GPU
-    # cool / clock-stabilize between back-to-back do_bench windows.
     time.sleep(1.0)
     ms_bf16 = do_bench(fwd_bf16, warmup=warmup, rep=rep) * 1e-3
     time.sleep(1.0)
@@ -107,7 +84,6 @@ def bench_one(name, shape, warmup, rep):
     time.sleep(1.0)
     ms_fused = do_bench(fwd_fp8_fused, warmup=warmup, rep=rep) * 1e-3
 
-    # FLOPS shared by all three paths (post-quant cast is negligible vs attn).
     n_flops = flops(batch, nh, sq, sk, dq, dv, causal=causal)
     def tflops(s): return n_flops / s * 1e-12
 
