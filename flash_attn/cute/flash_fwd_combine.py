@@ -355,9 +355,9 @@ class FlashAttentionForwardCombine:
         tidx, _, _ = cute.arch.thread_idx()
         m_block, k_block, maybe_virtual_batch = cute.arch.block_idx()
 
-        # Load FP8 output scale and invert in-kernel.
+        # Load FP8 output scale and invert in-kernel via rcp_approx.
         if const_expr(self.quant_key == "kFp8StaticTensorSym"):
-            output_scale_inv = 1.0 / Float32(output_scale[0])
+            output_scale_inv = cute.arch.rcp_approx(Float32(output_scale[0]))
 
         # Map virtual batch index to real batch index (for persistent tile schedulers)
         batch_idx = (
