@@ -2279,9 +2279,9 @@ class FlashAttentionForwardSm100:
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(self.q_stage)]
         tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
-        # Load FP8 output scale and invert in-kernel via rcp_approx.
+        # Load FP8 output scale and invert in-kernel via IEEE fdiv.
         if const_expr(self.quant_key == "kFp8StaticTensorSym"):
-            output_scale_inv = cute.arch.rcp_approx(Float32(output_scale[0]))
+            output_scale_inv = Float32(1.0) / Float32(output_scale[0])
 
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
