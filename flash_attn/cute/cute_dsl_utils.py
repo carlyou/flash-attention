@@ -83,6 +83,14 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
         tensor.element_type = (
             cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
         )
+    elif t.dtype == torch.float4_e2m1fn_x2:
+        # Packed 2x e2m1 per byte: export as uint8 with the packed shape; the kernel
+        # recasts to Float4E2M1FN (doubling the contiguous mode) on entry.
+        tensor = from_dlpack(
+            t.view(torch.uint8).detach(),
+            assumed_align=assumed_align,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
     else:
         tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:

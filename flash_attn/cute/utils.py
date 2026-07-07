@@ -992,6 +992,26 @@ class Fp8Group(QuantKey):
         return f"kFp8Group{self.group_size}Sym"
 
 
+@dataclass(frozen=True)
+class Nvfp4(QuantKey):
+    """Two-level NVFP4 (vLLM ``scaled_fp4_quant`` semantics): e2m1 codes, per-``group_size``
+    dynamic e4m3 block scales pre-multiplied by the static fp32 global scale (``output_scale``).
+    Dequant is ``e2m1 * float(e4m3_scale) / output_scale``. ``swizzled`` writes the scales in
+    the 128x4-interleaved layout consumed by cutlass/flashinfer NVFP4 GEMMs (selected by a 2D
+    ``(round_up(tokens, 128), round_up(num_heads * head_dim_v // 16, 4))`` scales buffer)."""
+
+    group_size: int = 16
+    swizzled: bool = False
+
+    @property
+    def max_val(self) -> float:
+        # torch.finfo doesn't support the packed float4_e2m1fn_x2 dtype.
+        return 6.0
+
+    def __str__(self) -> str:
+        return f"kNvfp4Group{self.group_size}Sym"
+
+
 def derive_output_quant_key(output_scale, output_scales, out, head_dim_v) -> Optional[QuantKey]:
     """Build the :class:`QuantKey` for fused quantized output, or None for an unquantized pass.
 
@@ -1001,15 +1021,30 @@ def derive_output_quant_key(output_scale, output_scales, out, head_dim_v) -> Opt
     """
     if output_scale is None and output_scales is None:
         return None
-    if output_scale is not None and output_scales is not None:
-        # Per-tensor + per-group together is a two-level (nvfp4-style) scheme, unsupported.
-        raise ValueError(
-            "output_scale (per-tensor) and output_scales (per-group) are mutually exclusive"
-        )
     assert out is not None, (
         "fused quantized output requires a pre-allocated `out` tensor; its dtype selects the "
-        "fp8 variant (e4m3fn or e5m2)"
+        "fp8 variant (e4m3fn or e5m2) or nvfp4 (float4_e2m1fn_x2)"
     )
+    if output_scale is not None and output_scales is not None:
+        # Per-tensor + per-group together is the two-level NVFP4 scheme: e2m1 codes with
+        # dynamic e4m3 block scales, pre-scaled by the static per-tensor global scale.
+        assert out.dtype == torch.float4_e2m1fn_x2, (
+            f"output_scale + output_scales (NVFP4) requires out dtype float4_e2m1fn_x2, got {out.dtype}"
+        )
+        assert output_scale.dtype == torch.float32, "output_scale must be float32"
+        assert output_scale.numel() == 1, "output_scale must be a scalar (numel == 1) tensor"
+        assert output_scales.dtype == torch.float8_e4m3fn, (
+            f"NVFP4 output_scales must be float8_e4m3fn, got {output_scales.dtype}"
+        )
+        if output_scales.ndim == 2:
+            # vLLM 128x4-swizzled scale-factor buffer (row-major would be >= 3D: (..., nh, groups)).
+            return Nvfp4(out.dtype, 16, swizzled=True)
+        group_size = head_dim_v // output_scales.shape[-1]
+        assert group_size == 16, (
+            f"NVFP4 output requires group_size 16 (output_scales last dim "
+            f"{output_scales.shape[-1]} vs head_dim_v {head_dim_v})"
+        )
+        return Nvfp4(out.dtype, group_size)
     dtype = out.dtype
     assert dtype in _FUSED_OUTPUT_QUANT_DTYPES, (
         f"fused quantized output requires out dtype in {_FUSED_OUTPUT_QUANT_DTYPES}, got {dtype}"
@@ -1051,6 +1086,29 @@ def fp8_block_scale_and_inv(amax: Float32, max_val: Float32, ue8m0: cutlass.Cons
     block_scale = Float32(0.0) if is_zero else amax * (Float32(1.0) / max_val)
     to_fp8_inv = Float32(0.0) if is_zero else cute.arch.rcp_approx(block_scale)
     return block_scale, to_fp8_inv
+
+
+@cute.jit
+def nvfp4_block_scale_and_inv(amax: Float32, fp4_max: Float32, global_scale: Float32):
+    """``(sf_e4m3, to_fp4_inv)`` for NVFP4 (vLLM ``scaled_fp4_quant`` semantics).
+
+    ``sf_e4m3`` = e4m3(amax / fp4_max * global_scale) is the stored block scale;
+    ``to_fp4_inv`` = global_scale / float(sf_e4m3) is the quantize multiplier
+    (dequant = e2m1 * float(sf_e4m3) / global_scale). Scalar f32<->f8 cvts are
+    rejected by the MLIR backend, so the casts go through 4-wide (32-bit)
+    fragments (2-wide breaks the backend's i32-packed vector cast).
+    """
+    sf_f32 = cute.make_fragment(4, Float32)
+    sf_f32[0] = amax * (Float32(1.0) / fp4_max) * global_scale
+    for _i in cutlass.range_constexpr(1, 4):
+        sf_f32[_i] = Float32(0.0)
+    sf_e4m3 = cute.make_fragment(4, cutlass.Float8E4M3FN)
+    sf_e4m3.store(sf_f32.load().to(cutlass.Float8E4M3FN))
+    sf_back = cute.make_fragment(4, Float32)
+    sf_back.store(sf_e4m3.load().to(Float32))
+    is_zero = sf_back[0] == 0.0
+    to_fp4_inv = Float32(0.0) if is_zero else global_scale * cute.arch.rcp_approx(sf_back[0])
+    return sf_e4m3[0], to_fp4_inv
 
 
 @cute.jit

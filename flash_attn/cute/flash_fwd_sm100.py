@@ -409,6 +409,9 @@ class FlashAttentionForwardSm100:
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
+        if const_expr(isinstance(self.output_quant_key, utils.Nvfp4)):
+            # NVFP4 mO arrives as packed bytes (..., dv/2); reinterpret as logical e2m1 (..., dv).
+            mO = cute.recast_tensor(mO, cutlass.Float4E2M1FN)
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
@@ -434,10 +437,21 @@ class FlashAttentionForwardSm100:
             else None
         )
         if const_expr(output_scales is not None):
-            output_scales = cute.make_tensor(
-                output_scales.iterator,
-                cute.select(output_scales.layout, mode=O_layout_transpose),
-            )
+            if const_expr(isinstance(self.output_quant_key, utils.Nvfp4) and self.output_quant_key.swizzled):
+                # 128x4-interleaved scale-factor layout (cutlass/flashinfer NVFP4 GEMM input):
+                # sf(m, k) lives at (m//128)*512*Kb + (k//4)*512 + (m%32)*16 + ((m%128)//32)*4 + (k%4),
+                # a pure strided layout over the padded (128*Mb, 4*Kb) buffer.
+                Mb = output_scales.shape[0] // 128
+                Kb = output_scales.shape[1] // 4
+                output_scales = cute.make_tensor(
+                    output_scales.iterator,
+                    cute.make_layout(((32, 4, Mb), (4, Kb)), stride=((16, 4, 512 * Kb), (1, 512))),
+                )
+            else:
+                output_scales = cute.make_tensor(
+                    output_scales.iterator,
+                    cute.select(output_scales.layout, mode=O_layout_transpose),
+                )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -2431,6 +2445,10 @@ class FlashAttentionForwardSm100:
         # Load FP8 output scale and invert in-kernel (per-tensor static path).
         if const_expr(isinstance(self.output_quant_key, utils.Fp8Static)):
             output_scale_inv = Float32(1.0) / Float32(output_scale[0])
+        # NVFP4: the global scale folds into the e4m3 block scales, not the row scale.
+        output_scale_global = None
+        if const_expr(isinstance(self.output_quant_key, utils.Nvfp4)):
+            output_scale_global = Float32(output_scale[0])
 
         # First iter: no correction is required
         # Notify mma warp that O has been rescaled
@@ -2471,12 +2489,25 @@ class FlashAttentionForwardSm100:
                 )  # (128, 128, 2)
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
 
-            # Per-group FP8 scales view for this batch/head (SplitKV: combine writes them).
+            # Per-group scales view for this batch/head (SplitKV: combine writes them).
             mScales_cur = None
-            if const_expr(isinstance(self.output_quant_key, utils.Fp8Group) and not self.is_split_kv):
-                mScales_cur = seqlen.offset_batch_Q(output_scales, batch_idx, dim=3)[
-                    None, None, head_idx
-                ]
+            scales_base = None
+            if const_expr(isinstance(self.output_quant_key, (utils.Fp8Group, utils.Nvfp4)) and not self.is_split_kv):
+                if const_expr(isinstance(self.output_quant_key, utils.Nvfp4) and self.output_quant_key.swizzled):
+                    # The swizzled layout is non-affine in the flat token row, so the batch/head
+                    # base can't be folded into the pointer (domain_offset); the epilogue adds it
+                    # to the coordinate instead.
+                    if const_expr(seqlen.has_cu_seqlens_q):
+                        scales_row = seqlen.offset_q
+                    else:
+                        scales_row = batch_idx * seqlen.seqlen_q
+                    num_scale_groups = self.head_dim_v_padded // self.output_quant_key.group_size
+                    scales_base = (scales_row, head_idx * num_scale_groups)
+                    mScales_cur = output_scales
+                else:
+                    mScales_cur = seqlen.offset_batch_Q(output_scales, batch_idx, dim=3)[
+                        None, None, head_idx
+                    ]
 
             # Default LSE to -inf for invalid split_idx tiles
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
@@ -2598,6 +2629,8 @@ class FlashAttentionForwardSm100:
                         gO_stage,
                         gmem_tiled_copy_O,
                         mScales_cur=mScales_cur,
+                        output_scale_global=output_scale_global,
+                        scales_base=scales_base,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2859,6 +2892,77 @@ class FlashAttentionForwardSm100:
                 mScales_cur[m_global, ig] = block_scale
 
     @cute.jit
+    def _epilogue_cast_nvfp4(
+        self,
+        tiled_tmem_load: cute.TiledCopy,
+        tiled_smem_store: cute.TiledCopy,
+        tOtO_t2r: cute.Tensor,
+        tOsO_s2r: cute.Tensor,
+        tOcO_t2r: cute.Tensor,
+        scale: Float32,
+        corr_tile_size: cutlass.Constexpr[int],
+        tidx: Int32,
+        m_tile_idx: Int32,
+        seqlen_q: Int32,
+        mScales_cur: cute.Tensor,
+        output_scale_global: Float32,
+        scales_base=None,
+    ):
+        """Per-row NVFP4 cast (``kNvfp4Group16Sym``).
+
+        ``corr_tile_size == group_size`` (16), so each correction tile is one scale
+        group and casts in a single pass: apply the per-row ``scale``, reduce the
+        group amax, derive the e4m3 block scale (pre-multiplied by the global scale,
+        vLLM ``scaled_fp4_quant`` semantics), then normalize and cvt to packed e2m1.
+        """
+        fp4_max = Float32(self.output_quant_key.max_val)
+        num_groups: cutlass.Constexpr[int] = self.head_dim_v_padded // corr_tile_size
+
+        # One correction thread owns one row (4 warps = 128 threads = m_block_size).
+        seqlen_limit = seqlen_q * self.qhead_per_kvhead if const_expr(self.pack_gqa) else seqlen_q
+        m_global = m_tile_idx * self.m_block_size + tidx
+        row_in_bounds = m_global < seqlen_limit
+
+        for ig in cutlass.range_constexpr(num_groups):
+            tOtO_t2r_i = tOtO_t2r[None, 0, 0, ig]
+            tOsO_r2s_i = tOsO_s2r[None, 0, 0, ig]
+            tOrO_frg = cute.make_fragment(
+                tOcO_t2r[None, 0, 0, ig].shape, self.pv_acc_dtype
+            )
+            cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+            # Apply the per-row `scale` (1/row_sum) and reduce the group amax.
+            group_amax = Float32(0.0)
+            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale)
+                )
+            for j in cutlass.range_constexpr(cute.size(tOrO_frg)):
+                v = tOrO_frg[j]
+                # |v| via fmax(v, -v): no fabs in cute.math.
+                group_amax = utils.fmax(group_amax, utils.fmax(v, -v))
+
+            # Block scale is quantized to e4m3 before inversion so the codes round-trip
+            # exactly; all-zero groups get a zero scale so the e2m1 codes come out zero.
+            sf_e4m3, to_fp4_inv = utils.nvfp4_block_scale_and_inv(
+                group_amax, fp4_max, output_scale_global
+            )
+
+            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tOrO_frg[j], tOrO_frg[j + 1]), (to_fp4_inv, to_fp4_inv)
+                )
+            copy_utils.cvt_copy(tiled_smem_store, tOrO_frg, tOsO_r2s_i)
+
+            # One thread owns one row; write its single e4m3 scale for this group.
+            if row_in_bounds:
+                if const_expr(scales_base is not None):
+                    # Swizzled: the layout is non-affine in the token row, so index the
+                    # full buffer with the absolute (row, group) coordinate.
+                    mScales_cur[scales_base[0] + m_global, scales_base[1] + ig] = sf_e4m3
+                else:
+                    mScales_cur[m_global, ig] = sf_e4m3
+
+    @cute.jit
     def correction_epilogue(
         self,
         thr_mma: cute.core.ThrMma,
@@ -2873,6 +2977,8 @@ class FlashAttentionForwardSm100:
         gO: Optional[cute.Tensor] = None,
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
         mScales_cur: Optional[cute.Tensor] = None,
+        output_scale_global: Optional[Float32] = None,
+        scales_base=None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2895,11 +3001,17 @@ class FlashAttentionForwardSm100:
         :type scale: Float32
         :param sO: Shared memory tensor for the final output
         :type sO: cute.Tensor
-        :param mScales_cur: per-(batch, head) per-group output-scale view; per-group FP8 only
+        :param mScales_cur: per-(batch, head) per-group output-scale view; per-group FP8/NVFP4 only
         :type mScales_cur: Optional[cute.Tensor]
+        :param output_scale_global: static per-tensor global scale; NVFP4 only
+        :type output_scale_global: Optional[Float32]
         """
 
-        corr_tile_size = 8 * 32 // self.o_dtype.width
+        if const_expr(isinstance(self.output_quant_key, utils.Nvfp4)):
+            # One correction tile per 16-element scale group: single-pass amax + cast per group.
+            corr_tile_size = self.output_quant_key.group_size
+        else:
+            corr_tile_size = 8 * 32 // self.o_dtype.width
         # Use CTA 0 mapping for smem partitioning since sO is per-CTA sized
         tOsO = thr_mma.get_slice(0).partition_C(sO)
         tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
@@ -2936,6 +3048,15 @@ class FlashAttentionForwardSm100:
                 tOtO_t2r, tOsO_s2r, tOcO_t2r,
                 scale, corr_tile_size,
                 tidx, m_tile_idx, seqlen_q, mScales_cur,
+            )
+        elif const_expr(isinstance(self.output_quant_key, utils.Nvfp4)):
+            m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+            self._epilogue_cast_nvfp4(
+                tiled_tmem_load, tiled_smem_store,
+                tOtO_t2r, tOsO_s2r, tOcO_t2r,
+                scale, corr_tile_size,
+                tidx, m_tile_idx, seqlen_q, mScales_cur, output_scale_global,
+                scales_base,
             )
         else:
             self._epilogue_cast_default(

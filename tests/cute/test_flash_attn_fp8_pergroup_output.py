@@ -439,10 +439,11 @@ def test_fp8_pergroup_output_validation_errors():
     k = torch.randn(1, 128, 4, 128, dtype=torch.bfloat16, device=device)
     v = torch.randn(1, 128, 4, 128, dtype=torch.bfloat16, device=device)
 
-    # output_scale + output_scales mutually exclusive
+    # output_scale + output_scales together selects NVFP4, which needs a pre-allocated
+    # float4_e2m1fn_x2 `out` (and e4m3 scales); without one it must raise loudly.
     scale = torch.tensor(0.01, dtype=torch.float32, device=device)
     scales_buf = torch.empty(1, 128, 4, 1, dtype=torch.float32, device=device)
-    with pytest.raises(ValueError):
+    with pytest.raises(AssertionError):
         flash_attn_func(q, k, v, output_scale=scale, output_scales=scales_buf)
 
     # output_scales last dim must divide head_dim_v
