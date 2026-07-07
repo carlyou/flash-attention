@@ -60,8 +60,32 @@ def _per_group_fp8_quant_eager(
     return fp8.flatten(-2), dequant_scale
 
 
+NVFP4_GROUP_SIZE = 16
+FP4_MAX = 6.0
+_E2M1_BUCKET_BOUNDS = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)  # midpoints of the e2m1 grid
+
+
+def _nvfp4_quant_eager(
+    out_bf16: torch.Tensor, global_scale: float, bounds: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Stand-in for vLLM's ``scaled_fp4_quant`` (packed e2m1 codes + e4m3 block scales)."""
+    x = out_bf16.float()
+    head_dim = x.shape[-1]
+    x_grp = x.unflatten(-1, (head_dim // NVFP4_GROUP_SIZE, NVFP4_GROUP_SIZE))
+    amax = x_grp.abs().amax(dim=-1)
+    sf = (amax * (1.0 / FP4_MAX) * global_scale).to(torch.float8_e4m3fn)
+    sf_back = sf.float()
+    inv = torch.where(sf_back == 0, torch.zeros_like(sf_back), global_scale / sf_back)
+    q = (x_grp * inv.unsqueeze(-1)).flatten(-2)
+    codes = torch.bucketize(q.abs().clamp(max=FP4_MAX), bounds).to(torch.uint8)
+    codes = codes | (q < 0).to(torch.uint8) * 8
+    packed = codes[..., 0::2] | (codes[..., 1::2] << 4)
+    return packed, sf
+
+
 _static_fp8_quant_compiled = torch.compile(_static_fp8_quant_eager, mode="reduce-overhead")
 _per_group_fp8_quant_compiled = torch.compile(_per_group_fp8_quant_eager, mode="reduce-overhead")
+_nvfp4_quant_compiled = torch.compile(_nvfp4_quant_eager, mode="reduce-overhead")
 
 
 def _setup_static(q, k, v, causal, num_splits, batch, sq, nh, dv, device):
@@ -122,10 +146,37 @@ def _setup_pergroup_ue8m0(*args, **kwargs):
     return _setup_pergroup(*args, ue8m0=True, **kwargs)
 
 
+def _setup_nvfp4(q, k, v, causal, num_splits, batch, sq, nh, dv, device):
+    """Return (unfused_baseline_fn, fused_fn) for the NVFP4 path (16-elem e4m3 scales)."""
+    # vLLM-style static global scale from a representative forward.
+    ref_out, _ = flash_attn_func(q, k, v, causal=causal)
+    amax = float(ref_out.float().abs().amax().item())
+    global_scale = 448.0 * FP4_MAX / max(amax, 1e-4)
+    global_scale_t = torch.tensor(global_scale, dtype=torch.float32, device=device)
+    fp4_buf = torch.empty(batch, sq, nh, dv // 2, dtype=torch.float4_e2m1fn_x2, device=device)
+    scales_buf = torch.empty(
+        batch, sq, nh, dv // NVFP4_GROUP_SIZE, dtype=torch.float8_e4m3fn, device=device
+    )
+    bounds = torch.tensor(_E2M1_BUCKET_BOUNDS, dtype=torch.float32, device=device)
+
+    def unfused():
+        out, _ = flash_attn_func(q, k, v, causal=causal, num_splits=num_splits)
+        return _nvfp4_quant_compiled(out, global_scale, bounds)
+
+    def fused():
+        return flash_attn_func(
+            q, k, v, causal=causal, num_splits=num_splits, out=fp4_buf,
+            output_scale=global_scale_t, output_scales=scales_buf,
+        )
+
+    return unfused, fused
+
+
 QUANT_MODES = {
     "static":         {"setup": _setup_static,         "label": "fused-fp8"},
     "pergroup":       {"setup": _setup_pergroup,       "label": "fused-pg-fp8"},
     "pergroup-ue8m0": {"setup": _setup_pergroup_ue8m0, "label": "fused-pg-ue8m0"},
+    "nvfp4":          {"setup": _setup_nvfp4,          "label": "fused-nvfp4"},
 }
 
 
@@ -193,6 +244,9 @@ def main():
 
     for quant in quants:
         for name in shapes:
+            if quant == "nvfp4" and SHAPES[name][-1] > 1:
+                print(f"[{quant:<8}] {name:<20} skipped (NVFP4 + SplitKV not supported yet)")
+                continue
             torch.cuda.empty_cache()
             bench_one(name, SHAPES[name], quant, args.warmup, args.rep)
         print()
