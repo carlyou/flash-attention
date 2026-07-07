@@ -437,10 +437,21 @@ class FlashAttentionForwardSm100:
             else None
         )
         if const_expr(output_scales is not None):
-            output_scales = cute.make_tensor(
-                output_scales.iterator,
-                cute.select(output_scales.layout, mode=O_layout_transpose),
-            )
+            if const_expr(isinstance(self.output_quant_key, utils.Nvfp4) and self.output_quant_key.swizzled):
+                # 128x4-interleaved scale-factor layout (cutlass/flashinfer NVFP4 GEMM input):
+                # sf(m, k) lives at (m//128)*512*Kb + (k//4)*512 + (m%32)*16 + ((m%128)//32)*4 + (k%4),
+                # a pure strided layout over the padded (128*Mb, 4*Kb) buffer.
+                Mb = output_scales.shape[0] // 128
+                Kb = output_scales.shape[1] // 4
+                output_scales = cute.make_tensor(
+                    output_scales.iterator,
+                    cute.make_layout(((32, 4, Mb), (4, Kb)), stride=((16, 4, 512 * Kb), (1, 512))),
+                )
+            else:
+                output_scales = cute.make_tensor(
+                    output_scales.iterator,
+                    cute.select(output_scales.layout, mode=O_layout_transpose),
+                )
         # (s, d, h, b) -> (d, s, h, b)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
@@ -2480,10 +2491,23 @@ class FlashAttentionForwardSm100:
 
             # Per-group scales view for this batch/head (SplitKV: combine writes them).
             mScales_cur = None
+            scales_base = None
             if const_expr(isinstance(self.output_quant_key, (utils.Fp8Group, utils.Nvfp4)) and not self.is_split_kv):
-                mScales_cur = seqlen.offset_batch_Q(output_scales, batch_idx, dim=3)[
-                    None, None, head_idx
-                ]
+                if const_expr(isinstance(self.output_quant_key, utils.Nvfp4) and self.output_quant_key.swizzled):
+                    # The swizzled layout is non-affine in the flat token row, so the batch/head
+                    # base can't be folded into the pointer (domain_offset); the epilogue adds it
+                    # to the coordinate instead.
+                    if const_expr(seqlen.has_cu_seqlens_q):
+                        scales_row = seqlen.offset_q
+                    else:
+                        scales_row = batch_idx * seqlen.seqlen_q
+                    num_scale_groups = self.head_dim_v_padded // self.output_quant_key.group_size
+                    scales_base = (scales_row, head_idx * num_scale_groups)
+                    mScales_cur = output_scales
+                else:
+                    mScales_cur = seqlen.offset_batch_Q(output_scales, batch_idx, dim=3)[
+                        None, None, head_idx
+                    ]
 
             # Default LSE to -inf for invalid split_idx tiles
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
@@ -2606,6 +2630,7 @@ class FlashAttentionForwardSm100:
                         gmem_tiled_copy_O,
                         mScales_cur=mScales_cur,
                         output_scale_global=output_scale_global,
+                        scales_base=scales_base,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
@@ -2881,6 +2906,7 @@ class FlashAttentionForwardSm100:
         seqlen_q: Int32,
         mScales_cur: cute.Tensor,
         output_scale_global: Float32,
+        scales_base=None,
     ):
         """Per-row NVFP4 cast (``kNvfp4Group16Sym``).
 
@@ -2929,7 +2955,12 @@ class FlashAttentionForwardSm100:
 
             # One thread owns one row; write its single e4m3 scale for this group.
             if row_in_bounds:
-                mScales_cur[m_global, ig] = sf_e4m3
+                if const_expr(scales_base is not None):
+                    # Swizzled: the layout is non-affine in the token row, so index the
+                    # full buffer with the absolute (row, group) coordinate.
+                    mScales_cur[scales_base[0] + m_global, scales_base[1] + ig] = sf_e4m3
+                else:
+                    mScales_cur[m_global, ig] = sf_e4m3
 
     @cute.jit
     def correction_epilogue(
@@ -2947,6 +2978,7 @@ class FlashAttentionForwardSm100:
         gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
         mScales_cur: Optional[cute.Tensor] = None,
         output_scale_global: Optional[Float32] = None,
+        scales_base=None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -3024,6 +3056,7 @@ class FlashAttentionForwardSm100:
                 tOtO_t2r, tOsO_s2r, tOcO_t2r,
                 scale, corr_tile_size,
                 tidx, m_tile_idx, seqlen_q, mScales_cur, output_scale_global,
+                scales_base,
             )
         else:
             self._epilogue_cast_default(

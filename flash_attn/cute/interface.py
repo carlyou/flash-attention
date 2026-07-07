@@ -557,8 +557,16 @@ def _flash_attn_fwd(
         _validate_tensor(output_scales, "output_scales", scales_shape, torch.float32, device)
     elif isinstance(output_quant_key, utils.Nvfp4):
         _validate_tensor(output_scale, "output_scale", (1,), torch.float32, device)
-        scales_shape = (*q_batch_seqlen_shape, num_head, head_dim_v // output_quant_key.group_size)
-        _validate_tensor(output_scales, "output_scales", scales_shape, torch.float8_e4m3fn, device)
+        if output_quant_key.swizzled:
+            assert not pack_gqa, "swizzled NVFP4 output_scales not supported with pack_gqa"
+            num_rows = math.prod(q_batch_seqlen_shape)
+            num_groups = num_head * head_dim_v // output_quant_key.group_size
+            scales_shape = ((num_rows + 127) // 128 * 128, (num_groups + 3) // 4 * 4)
+            _validate_tensor(output_scales, "output_scales", scales_shape, torch.float8_e4m3fn, device)
+            assert output_scales.is_contiguous(), "swizzled output_scales must be contiguous"
+        else:
+            scales_shape = (*q_batch_seqlen_shape, num_head, head_dim_v // output_quant_key.group_size)
+            _validate_tensor(output_scales, "output_scales", scales_shape, torch.float8_e4m3fn, device)
 
     if lse is None:
         lse = (

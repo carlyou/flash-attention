@@ -996,9 +996,12 @@ class Fp8Group(QuantKey):
 class Nvfp4(QuantKey):
     """Two-level NVFP4 (vLLM ``scaled_fp4_quant`` semantics): e2m1 codes, per-``group_size``
     dynamic e4m3 block scales pre-multiplied by the static fp32 global scale (``output_scale``).
-    Dequant is ``e2m1 * float(e4m3_scale) / output_scale``."""
+    Dequant is ``e2m1 * float(e4m3_scale) / output_scale``. ``swizzled`` writes the scales in
+    the 128x4-interleaved layout consumed by cutlass/flashinfer NVFP4 GEMMs (selected by a 2D
+    ``(round_up(tokens, 128), round_up(num_heads * head_dim_v // 16, 4))`` scales buffer)."""
 
     group_size: int = 16
+    swizzled: bool = False
 
     @property
     def max_val(self) -> float:
@@ -1033,6 +1036,9 @@ def derive_output_quant_key(output_scale, output_scales, out, head_dim_v) -> Opt
         assert output_scales.dtype == torch.float8_e4m3fn, (
             f"NVFP4 output_scales must be float8_e4m3fn, got {output_scales.dtype}"
         )
+        if output_scales.ndim == 2:
+            # vLLM 128x4-swizzled scale-factor buffer (row-major would be >= 3D: (..., nh, groups)).
+            return Nvfp4(out.dtype, 16, swizzled=True)
         group_size = head_dim_v // output_scales.shape[-1]
         assert group_size == 16, (
             f"NVFP4 output requires group_size 16 (output_scales last dim "

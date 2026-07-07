@@ -268,6 +268,94 @@ def test_nvfp4_output_varlen():
     )
 
 
+def _unswizzle_scales(sw: torch.Tensor, m: int, k: int) -> torch.Tensor:
+    """Inverse of the cutlass/flashinfer 128x4 scale-factor interleave (vLLM
+    ``convert_swizzled_to_linear`` semantics)."""
+    m_tiles = sw.shape[0] // 128
+    k_tiles = sw.shape[1] // 4
+    tmp = sw.reshape(m_tiles, k_tiles, 32, 4, 4)
+    tmp = tmp.permute(0, 3, 2, 1, 4)  # (m_tiles, 4, 32, k_tiles, 4)
+    return tmp.reshape(m_tiles * 128, k_tiles * 4)[:m, :k]
+
+
+@skip_if_no_nvfp4_sm
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_nvfp4_output_varlen_swizzled_scales():
+    """vLLM layout: 2D 128x4-swizzled e4m3 scale buffer over (tokens, nh * groups)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    # Non-multiple-of-128 sequence offsets stress the non-affine swizzle indexing.
+    seqlens = [256, 384, 500, 204]
+    total_q = sum(seqlens)
+    num_heads = num_kv_heads = 8  # MLA-prefill-like (no pack_gqa)
+    head_dim = head_dim_v = 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(total_q, num_heads, head_dim, dtype=dtype, device=device)
+    k = torch.randn(total_q, num_kv_heads, head_dim, dtype=dtype, device=device)
+    v = torch.randn(total_q, num_kv_heads, head_dim_v, dtype=dtype, device=device)
+    cu_seqlens = torch.zeros(len(seqlens) + 1, dtype=torch.int32, device=device)
+    cu_seqlens[1:] = torch.tensor(seqlens, dtype=torch.int32, device=device).cumsum(0)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+    global_scale = torch.tensor(448.0, dtype=torch.float32, device=device)
+
+    num_groups = num_heads * head_dim_v // GROUP_SIZE
+    out_buf = torch.empty(
+        total_q, num_heads, head_dim_v // 2, dtype=torch.float4_e2m1fn_x2, device=device
+    )
+    scales_buf = torch.full(
+        ((total_q + 127) // 128 * 128, (num_groups + 3) // 4 * 4),
+        float("nan"),
+        dtype=torch.float32, device=device,
+    ).to(torch.float8_e4m3fn)
+    out, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+        softmax_scale=softmax_scale, causal=True,
+        out=out_buf, output_scale=global_scale, output_scales=scales_buf,
+    )
+    if is_fake_mode():
+        return
+    assert out.dtype == torch.float4_e2m1fn_x2
+
+    # All in-range scale slots must have been written (NaN-poisoned at alloc).
+    scales_linear = _unswizzle_scales(scales_buf, total_q, num_groups)
+    assert not scales_linear.float().isnan().any(), "unwritten scale slots in swizzled buffer"
+    scales_row_major = scales_linear.unflatten(-1, (num_heads, head_dim_v // GROUP_SIZE))
+
+    rtol = 2.0
+    kernel_err = 0.0
+    eager_err = 0.0
+    fwd_atol = 0.0
+    for i, sl in enumerate(seqlens):
+        s, e = int(cu_seqlens[i].item()), int(cu_seqlens[i + 1].item())
+        qi = q[s:e].unsqueeze(0)
+        ki = k[s:e].unsqueeze(0)
+        vi = v[s:e].unsqueeze(0)
+        out_ref_fp32, _ = attention_ref(qi, ki, vi, None, None, causal=True, upcast=True)
+        out_pt_bf16, _ = attention_ref(
+            qi, ki, vi, None, None, causal=True, upcast=False, reorder_ops=True,
+        )
+        ref_codes, ref_scales = _quantize_nvfp4(out_ref_fp32, global_scale)
+        pt_codes, pt_scales = _quantize_nvfp4(out_pt_bf16, global_scale)
+        ref_deq = _dequantize_nvfp4(ref_codes, ref_scales, global_scale)
+        pt_deq = _dequantize_nvfp4(pt_codes, pt_scales, global_scale)
+        fused_deq = _dequantize_nvfp4(
+            _unpack_fp4(out[s:e].unsqueeze(0)),
+            scales_row_major[s:e].unsqueeze(0),
+            global_scale,
+        )
+        fwd_atol = max(fwd_atol, 2 * (ref_deq + 0.3 - 0.3 - ref_deq).abs().max().item())
+        kernel_err = max(kernel_err, (fused_deq - ref_deq).abs().max().item())
+        eager_err = max(eager_err, (pt_deq - ref_deq).abs().max().item())
+
+    assert kernel_err <= rtol * eager_err + fwd_atol, (
+        f"varlen swizzled fused NVFP4 max-err vs FP32 ref ({kernel_err:.4f}) > "
+        f"{rtol}x eager max-err ({eager_err:.4f}) + ULP atol ({fwd_atol:.4f})"
+    )
+
+
 @skip_if_no_nvfp4_sm
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_nvfp4_rejects_split_kv():
