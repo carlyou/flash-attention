@@ -416,6 +416,10 @@ def _flash_attn_fwd(
             output (dequant = out_fp8 * output_scale). SM100/SM110 only.
         output_scales: pre-allocated FP32 scales tensor; opts into per-group dynamic FP8
             output (group_size = head_dim_v // last dim). SM100/SM110 only.
+            Passing both output_scale (global scale) and output_scales (e4m3fn, 16-element
+            groups) with a float4_e2m1fn_x2 `out` selects fused NVFP4 output
+            (dequant = out_e2m1 * float(scale_e4m3) / output_scale, vLLM scaled_fp4_quant
+            semantics). SM100/SM110, non-SplitKV only.
         compile_only: If True, compile the selected kernel and return without
             launching it.
     """
@@ -527,8 +531,8 @@ def _flash_attn_fwd(
         assert block_sparse_tensors is None, "fused FP8 output + block sparsity not supported"
         assert page_table is None, "fused FP8 output + paged KV not supported"
         out_torch_dtype = output_quant_key.dtype
-        if isinstance(output_quant_key, utils.Fp8Static):
-            output_scale = output_scale.reshape(1)  # per-tensor static scalar
+        if isinstance(output_quant_key, (utils.Fp8Static, utils.Nvfp4)):
+            output_scale = output_scale.reshape(1)  # per-tensor static/global scalar
     else:
         out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
     device = q.device
@@ -536,12 +540,14 @@ def _flash_attn_fwd(
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
 
+    # NVFP4 out is packed 2 e2m1 codes per element, so its last dim is head_dim_v // 2.
+    out_head_dim = head_dim_v // 2 if isinstance(output_quant_key, utils.Nvfp4) else head_dim_v
     if out is None:
         out = torch.empty(
-            *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device
+            *q_batch_seqlen_shape, num_head, out_head_dim, dtype=out_torch_dtype, device=device
         )
     else:
-        _validate_tensor(out, "out", (*q_batch_seqlen_shape, num_head, head_dim_v), out_torch_dtype, device)
+        _validate_tensor(out, "out", (*q_batch_seqlen_shape, num_head, out_head_dim), out_torch_dtype, device)
 
     if isinstance(output_quant_key, utils.Fp8Static):
         _validate_tensor(output_scale, "output_scale", (1,), torch.float32, device)
@@ -549,6 +555,10 @@ def _flash_attn_fwd(
         assert output_scales is not None
         scales_shape = (*q_batch_seqlen_shape, num_head, head_dim_v // output_quant_key.group_size)
         _validate_tensor(output_scales, "output_scales", scales_shape, torch.float32, device)
+    elif isinstance(output_quant_key, utils.Nvfp4):
+        _validate_tensor(output_scale, "output_scale", (1,), torch.float32, device)
+        scales_shape = (*q_batch_seqlen_shape, num_head, head_dim_v // output_quant_key.group_size)
+        _validate_tensor(output_scales, "output_scales", scales_shape, torch.float8_e4m3fn, device)
 
     if lse is None:
         lse = (
@@ -663,6 +673,9 @@ def _flash_attn_fwd(
     is_split_kv = num_splits > 1
     assert not (is_split_kv and output_quant_key is not None and out.dtype == torch.float8_e5m2), (
         "fused e5m2 output is not supported with SplitKV (num_splits > 1); use e4m3fn or num_splits=1"
+    )
+    assert not (is_split_kv and isinstance(output_quant_key, utils.Nvfp4)), (
+        "fused NVFP4 output is not supported with SplitKV (num_splits > 1) yet; use num_splits=1"
     )
     if is_split_kv:
         if isinstance(q, _CompileOnlyTensorSpec):
@@ -861,7 +874,7 @@ def _flash_attn_fwd(
         )
         if output_scales is None:
             output_scales_tensor = None
-        elif output_quant_key.ue8m0:
+        elif isinstance(output_quant_key, utils.Fp8Group) and output_quant_key.ue8m0:
             # DeepGEMM column-major / TMA-aligned layout: the token dim is the contiguous one.
             leading = list(output_scales.stride()).index(1)
             output_scales_tensor = to_cute_tensor(output_scales, assumed_align=4, leading_dim=leading)
@@ -1172,7 +1185,7 @@ def _flash_attn_fwd(
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
         out_call = out.detach()
-        if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if out_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float4_e2m1fn_x2):
             out_call = out_call.view(torch.uint8)
         descale_tensors = (
             DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
@@ -1237,7 +1250,10 @@ def _flash_attn_fwd(
             if not use_dedicated_hd256_kernel:
                 call_args.append(output_scale)
                 if arch // 10 in [10, 11]:
-                    call_args.append(output_scales if not is_split_kv else None)
+                    output_scales_call = output_scales if not is_split_kv else None
+                    if output_scales_call is not None and output_scales_call.dtype == torch.float8_e4m3fn:
+                        output_scales_call = output_scales_call.view(torch.uint8)
+                    call_args.append(output_scales_call)
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
